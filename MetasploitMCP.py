@@ -1095,7 +1095,7 @@ async def run_exploit(
     options: Dict[str, Any],
     payload_name: Optional[str] = None,
     payload_options: Optional[Union[Dict[str, Any], str]] = None,
-    run_as_job: bool = False,
+    run_as_job: bool = True,  # DEFAULT: RPC job path (fast, polls sessions.list by exploit UUID)
     check_vulnerability: bool = False, # New option
     timeout_seconds: int = LONG_CONSOLE_READ_TIMEOUT # Used only if run_as_job=False
 ) -> Dict[str, Any]:
