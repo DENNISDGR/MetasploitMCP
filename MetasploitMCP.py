@@ -709,7 +709,7 @@ async def _execute_module_console(
                  message += f" Session {session_id} detected."
 
             # Check for common failure indicators
-            if any(fail in module_output.lower() for fail in ['exploit completed, but no session was created', 'exploit failed', 'run failed', 'check failed', 'module check failed']):
+            if session_id is None and any(fail in module_output.lower() for fail in ['exploit completed, but no session was created', 'exploit failed', 'run failed', 'check failed', 'module check failed']):
                  status = "error" if status != "warning" else status # Don't override warning if session might have opened
                  message = f"{module_type.capitalize()} module {full_module_path} execution via console appears to have failed. Check output."
                  logger.error(f"Failure detected in console output for {full_module_path}.")
