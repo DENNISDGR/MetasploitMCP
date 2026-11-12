@@ -775,6 +775,69 @@ async def _execute_module_console(
 # --- MCP Tool Definitions ---
 
 @mcp.tool()
+async def describe_module(module_type: str, module_name: str) -> Dict[str, Any]:
+    """
+    Inspect a module's options BEFORE running it - the equivalent of msfconsole
+    'use <module>; show options'. Returns every option's default value, whether it is
+    required, its type and description, plus `required_without_default`: the options you
+    MUST supply because they have no sensible default (e.g. RHOSTS). Best practice: set
+    ONLY those (plus the payload's LHOST for exploits) and leave everything else at its
+    default; if a run then errors, adjust the specific option it complains about.
+
+    Args:
+        module_type: 'exploit', 'auxiliary', 'post', or 'payload'.
+        module_name: Module path, e.g. 'unix/ftp/proftpd_modcopy_exec' (type prefix optional).
+    """
+    client = get_msf_client()
+    mt = (module_type or "").strip().lower()
+    mn = (module_name or "").strip()
+    for pfx in ("exploit/", "auxiliary/", "post/", "payload/", "encoder/", "nop/"):
+        if mn.startswith(pfx):
+            mn = mn[len(pfx):]
+            break
+    try:
+        opts = await asyncio.to_thread(lambda: client.call("module.options", [mt, mn]))
+    except Exception as e:
+        return {"status": "error", "message": f"Could not read options for {mt}/{mn}: {e}"}
+    if not isinstance(opts, dict):
+        return {"status": "error", "message": f"Unexpected options payload for {mt}/{mn}: {type(opts)}"}
+    clean = {}
+    required_without_default = []
+    for name, meta in opts.items():
+        if not isinstance(meta, dict):
+            continue
+        default = meta.get("default")
+        required = bool(meta.get("required"))
+        clean[name] = {
+            "required": required,
+            "default": default,
+            "type": meta.get("type"),
+            "desc": meta.get("desc"),
+        }
+        if required and (default is None or default == ""):
+            required_without_default.append(name)
+    info = {}
+    try:
+        mi = await asyncio.to_thread(lambda: client.call("module.info", [mt, mn]))
+        if isinstance(mi, dict):
+            info = {"name": mi.get("name"),
+                    "description": (mi.get("description") or "").strip(),
+                    "rank": mi.get("rank")}
+    except Exception:
+        pass
+    return {
+        "status": "success",
+        "module": f"{mt}/{mn}",
+        "info": info,
+        "options": clean,
+        "required_without_default": required_without_default,
+        "hint": ("Set only the options in required_without_default (plus the payload LHOST for "
+                 "exploits). Trust the other defaults. If a run errors, change only the specific "
+                 "option it names (e.g. SITEPATH/docroot) and retry."),
+    }
+
+
+@mcp.tool()
 async def list_exploits(search_term: str = "") -> List[str]:
     """
     List available Metasploit exploits, optionally filtered by search term.
