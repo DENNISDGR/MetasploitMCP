@@ -683,6 +683,17 @@ async def _execute_module_console(
 
             # Execute the final command (exploit, run, check)
             logger.info(f"Running final console command: {command}")
+            # Snapshot sessions BEFORE running so async reverse-shell callbacks that land
+            # after the console read returns are still attributed to this exploit.
+            _sessions_before = set()
+            if command in ("exploit", "run"):
+                try:
+                    _sl0 = await asyncio.to_thread(lambda: get_msf_client().sessions.list)
+                    if isinstance(_sl0, dict):
+                        _sessions_before = set(str(_k) for _k in _sl0.keys())
+                except Exception as _snap_e:
+                    logger.warning(f"Pre-exploit session snapshot failed: {_snap_e}")
+
             module_output = await run_command_safely(console, command, execution_timeout=timeout)
             logger.debug(f"Synchronous execution output length: {len(module_output)}")
 
@@ -698,6 +709,33 @@ async def _execute_module_console(
                      logger.info(f"Detected session {session_id} opened in console output.")
                  except (ValueError, IndexError):
                      logger.warning("Found session opened pattern, but failed to parse ID.")
+
+            # Fallback: console text often returns before a reverse shell connects back, so the
+            # regex above misses it. Poll sessions.list for a NEW session created by this run.
+            if session_id is None and command in ("exploit", "run"):
+                for _pi in range(8):
+                    try:
+                        _sl1 = await asyncio.to_thread(lambda: get_msf_client().sessions.list)
+                    except Exception as _poll_e:
+                        logger.warning(f"Post-exploit session poll failed: {_poll_e}")
+                        break
+                    if isinstance(_sl1, dict):
+                        _new = [k for k in _sl1.keys() if str(k) not in _sessions_before]
+                        if _new:
+                            try:
+                                _nk = sorted(_new, key=lambda x: int(x))[-1]
+                            except (ValueError, TypeError):
+                                _nk = _new[-1]
+                            try:
+                                session_id = int(_nk)
+                            except (ValueError, TypeError):
+                                session_id = _nk
+                            _si = _sl1.get(_nk)
+                            _stype = _si.get("type", "?") if isinstance(_si, dict) else "?"
+                            session_opened_line = f"session {session_id} opened (detected via sessions.list delta, type={_stype})"
+                            logger.info(f"Detected NEW session {session_id} via sessions.list delta after {command}.")
+                            break
+                    await asyncio.sleep(1.5)
 
             status = "success"
             message = f"{module_type.capitalize()} module {full_module_path} completed via console ({command})."
