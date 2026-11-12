@@ -1067,23 +1067,27 @@ async def run_exploit(
              logger.warning(f"Vulnerability check failed for {module_name}: {chk_e}. Proceeding with exploit attempt.")
              # Fall through to exploit attempt
 
-    # Execute the exploit
-    if run_as_job:
-        return await _execute_module_rpc(
-            module_type='exploit',
-            module_name=module_name,
-            module_options=options,
-            payload_spec=payload_spec
-        )
-    else:
-        return await _execute_module_console(
-            module_type='exploit',
-            module_name=module_name,
-            module_options=options,
-            command='exploit',
-            payload_spec=payload_spec,
-            timeout=timeout_seconds
-        )
+    # Execute the exploit (guard unexpected library errors -> structured error, not a raw tool crash)
+    try:
+        if run_as_job:
+            return await _execute_module_rpc(
+                module_type='exploit',
+                module_name=module_name,
+                module_options=options,
+                payload_spec=payload_spec
+            )
+        else:
+            return await _execute_module_console(
+                module_type='exploit',
+                module_name=module_name,
+                module_options=options,
+                command='exploit',
+                payload_spec=payload_spec,
+                timeout=timeout_seconds
+            )
+    except Exception as _e:
+        logger.exception(f"Unhandled error executing exploit {module_name}")
+        return {"status": "error", "message": f"Execution error for {module_name}: {_e}", "module": module_name}
 
 @mcp.tool()
 async def run_post_module(
