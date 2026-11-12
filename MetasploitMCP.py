@@ -1239,105 +1239,139 @@ async def send_session_command(
 ) -> Dict[str, Any]:
     """
     Send a command to an active Metasploit session (Meterpreter or Shell) and get output.
-    Uses session.run_with_output for Meterpreter, and a prompt-aware loop for shells.
-    The agent is responsible for parsing the raw output.
 
-    In Meterpreter mode, to run a shell command, run `shell` to enter the shell mode first.
-    To exit shell mode and return to Meterpreter, run `exit`.
-
-    Args:
-        session_id: ID of the target session.
-        command: Command string to execute in the session.
-        timeout_seconds: Maximum time to wait for the command to complete.
-
-    Returns:
-        Dictionary with status ('success', 'error', 'timeout') and raw command output.
+    This implementation avoids pymetasploit3 SessionManager.session(), which can fail
+    when Metasploit returns native integer session IDs. It resolves either int or str
+    keys from session.list, then uses raw RPC session.* calls with the native ID.
     """
     client = get_msf_client()
     logger.info(f"Sending command to session {session_id}: '{command}'")
-    session_id_str = str(session_id)
 
     try:
-        # --- Get Session Info and Object ---
+        # --- Resolve session using either native integer or string keys ---
         current_sessions = await asyncio.to_thread(lambda: client.sessions.list)
-        if session_id_str not in current_sessions:
+        if not isinstance(current_sessions, dict):
+            return {"status": "error", "message": f"Unexpected sessions list type: {type(current_sessions)}"}
+
+        native_session_id = None
+        session_info = None
+        for sid_key, sid_info in current_sessions.items():
+            if str(sid_key) == str(session_id):
+                native_session_id = sid_key
+                session_info = sid_info
+                break
+
+        if native_session_id is None:
             logger.error(f"Session {session_id} not found.")
             return {"status": "error", "message": f"Session {session_id} not found."}
 
-        session_info = current_sessions[session_id_str]
+        session_key = str(native_session_id)
         session_type = session_info.get('type', 'unknown').lower() if isinstance(session_info, dict) else 'unknown'
-        logger.debug(f"Session {session_id} type: {session_type}")
+        logger.debug(f"Session {session_id} resolved to native id {native_session_id!r}, type: {session_type}")
 
-        session = await asyncio.to_thread(lambda: client.sessions.session(session_id_str))
-        if not session:
-            logger.error(f"Failed to get session object for existing session {session_id}.")
-            return {"status": "error", "message": f"Error retrieving session {session_id} object."}
-
-        # --- Execute Command Based on Type ---
         output = ""
-        status = "error" # Default status
+        status = "error"
         message = "Command execution failed or type unknown."
 
+        # --- Execute Command Based on Type using raw RPC calls ---
         if session_type == 'meterpreter':
-            if session_shell_type.get(session_id_str) is None:
-                session_shell_type[session_id_str] = 'meterpreter'
+            if session_shell_type.get(session_key) is None:
+                session_shell_type[session_key] = 'meterpreter'
 
-            logger.debug(f"Using session.run_with_output for Meterpreter session {session_id}")
+            def mp_read() -> str:
+                res = client.call('session.meterpreter_read', [native_session_id])
+                return res.get('data', '') if isinstance(res, dict) else str(res)
+
+            def mp_write(data: str) -> Any:
+                if not data.endswith('\n'):
+                    data += '\n'
+                return client.call('session.meterpreter_write', [native_session_id, data])
+
+            def mp_detach() -> Any:
+                return client.call('session.meterpreter_session_detach', [native_session_id])
+
             try:
-                # Use asyncio.wait_for to handle timeout manually since run_with_output doesn't support timeout parameter
-                if command == "shell":
-                    if session_shell_type[session_id_str] == 'meterpreter':
-                        output = session.run_with_output(command, end_strs=['created.'])
-                        session_shell_type[session_id_str] = 'shell'
-                        session.read()  # Clear buffer
+                # Clear stale buffered data before sending a new command.
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(mp_read)
+
+                if command.strip() == "shell":
+                    if session_shell_type[session_key] == 'meterpreter':
+                        await asyncio.to_thread(mp_write, command)
+                        session_shell_type[session_key] = 'shell'
                     else:
                         output = "You are already in shell mode."
-                elif command == "exit":
-                    if session_shell_type[session_id_str] == 'meterpreter':
+                elif command.strip() == "exit":
+                    if session_shell_type[session_key] == 'meterpreter':
                         output = "You are already in meterpreter mode. No need to exit."
                     else:
-                        session.read()  # Clear buffer
-                        session.detach()
-                        session_shell_type[session_id_str] = 'meterpreter'
+                        await asyncio.to_thread(mp_detach)
+                        session_shell_type[session_key] = 'meterpreter'
                 else:
-                    output = await asyncio.wait_for(
-                        asyncio.to_thread(lambda: session.run_with_output(command)),
-                        timeout=timeout_seconds
-                    )
-                status = "success"
-                message = "Meterpreter command executed successfully."
-                logger.debug(f"Meterpreter command '{command}' completed.")
+                    await asyncio.to_thread(mp_write, command)
+
+                # Read until output arrives, then until a short inactivity window.
+                output_buffer = output
+                start_time = asyncio.get_event_loop().time()
+                last_data_time = start_time
+                first_data_seen = bool(output_buffer)
+                read_interval = 0.5
+                inactivity_after_data = 4.0
+                # Meterpreter over RPC can be slow to produce the first line after staged payloads.
+                # Do not declare "no output" until the caller's timeout is actually reached.
+                inactivity_before_data = timeout_seconds
+
+                while True:
+                    now = asyncio.get_event_loop().time()
+                    if (now - start_time) > timeout_seconds:
+                        status = "timeout"
+                        message = f"Meterpreter command timed out after {timeout_seconds} seconds."
+                        break
+
+                    chunk = await asyncio.to_thread(mp_read)
+                    if chunk:
+                        output_buffer += chunk
+                        last_data_time = now
+                        first_data_seen = True
+                    else:
+                        idle = now - last_data_time
+                        if first_data_seen and idle >= inactivity_after_data:
+                            status = "success"
+                            message = "Meterpreter command executed successfully."
+                            break
+                        if (not first_data_seen) and idle >= inactivity_before_data:
+                            status = "success"
+                            message = "Meterpreter command sent; no output returned before inactivity timeout."
+                            break
+
+                    await asyncio.sleep(read_interval)
+
+                output = output_buffer
+
             except asyncio.TimeoutError:
                 status = "timeout"
                 message = f"Meterpreter command timed out after {timeout_seconds} seconds."
-                logger.warning(f"Command '{command}' timed out on Meterpreter session {session_id}")
-                # Try a final read for potentially partial output
-                try:
-                    output = await asyncio.to_thread(lambda: session.read()) or ""
-                except: pass
             except (MsfRpcError, Exception) as run_err:
-                logger.error(f"Error during Meterpreter run_with_output for command '{command}': {run_err}")
+                logger.error(f"Error during Meterpreter raw RPC command '{command}': {run_err}")
                 message = f"Error executing Meterpreter command: {run_err}"
-                # Try a final read
-                try:
-                    output = await asyncio.to_thread(lambda: session.read()) or ""
-                except: pass
+                with contextlib.suppress(Exception):
+                    output = await asyncio.to_thread(mp_read) or output
 
         elif session_type == 'shell':
-            logger.debug(f"Using manual read loop for Shell session {session_id}")
+            def sh_read() -> str:
+                res = client.call('session.shell_read', [native_session_id])
+                return res.get('data', '') if isinstance(res, dict) else str(res)
+
+            def sh_write(data: str) -> Any:
+                if not data.endswith('\n'):
+                    data += '\n'
+                return client.call('session.shell_write', [native_session_id, data])
+
             try:
-                await asyncio.to_thread(lambda: session.write(command + "\n"))
-
-                # If the command is exit, don't wait for output/prompt, assume it worked
+                await asyncio.to_thread(sh_write, command)
                 if command.strip().lower() == 'exit':
-                    logger.info(f"Sent 'exit' to shell session {session_id}, assuming success without reading output.")
-                    status = "success"
-                    message = "Exit command sent to shell session."
-                    output = "(No output expected after exit)"
-                    # Skip the read loop for exit command
-                    return {"status": status, "message": message, "output": output}
+                    return {"status": "success", "message": "Exit command sent to shell session.", "output": "(No output expected after exit)"}
 
-                # Proceed with read loop for non-exit commands
                 output_buffer = ""
                 start_time = asyncio.get_event_loop().time()
                 last_data_time = start_time
@@ -1348,40 +1382,28 @@ async def send_session_command(
                     if (now - start_time) > timeout_seconds:
                         status = "timeout"
                         message = f"Shell command timed out after {timeout_seconds} seconds."
-                        logger.warning(f"Command '{command}' timed out on Shell session {session_id}")
                         break
 
-                    chunk = await asyncio.to_thread(lambda: session.read())
+                    chunk = await asyncio.to_thread(sh_read)
                     if chunk:
-                         output_buffer += chunk
-                         last_data_time = now
-                         # Check if the prompt appears at the end of the current buffer
-                         if SHELL_PROMPT_RE.search(output_buffer):
-                             logger.debug(f"Detected shell prompt for command '{command}'.")
-                             status = "success"
-                             message = "Shell command executed successfully."
-                             break
+                        output_buffer += chunk
+                        last_data_time = now
+                        if SHELL_PROMPT_RE.search(output_buffer):
+                            status = "success"
+                            message = "Shell command executed successfully."
+                            break
                     elif (now - last_data_time) > SESSION_READ_INACTIVITY_TIMEOUT:
-                         logger.debug(f"Shell inactivity timeout ({SESSION_READ_INACTIVITY_TIMEOUT}s) reached for command '{command}'. Assuming complete.")
-                         status = "success" # Assume success if inactive after sending command
-                         message = "Shell command likely completed (inactivity)."
-                         break
+                        status = "success"
+                        message = "Shell command likely completed (inactivity)."
+                        break
 
                     await asyncio.sleep(read_interval)
-                output = output_buffer # Assign final buffer to output
+                output = output_buffer
             except (MsfRpcError, Exception) as run_err:
-                # Special handling for errors after sending 'exit'
-                if command.strip().lower() == 'exit':
-                    logger.warning(f"Error occurred after sending 'exit' to shell {session_id}: {run_err}. This might be expected as session closes.")
-                    status = "success" # Treat as success
-                    message = f"Exit command sent, subsequent error likely due to session closing: {run_err}"
-                    output = "(Error reading after exit, likely expected)"
-                else:
-                    logger.error(f"Error during Shell write/read loop for command '{command}': {run_err}")
-                    message = f"Error executing Shell command: {run_err}"
-                    output = output_buffer # Return potentially partial output
+                logger.error(f"Error during Shell raw RPC command '{command}': {run_err}")
+                message = f"Error executing Shell command: {run_err}"
 
-        else: # Unknown session type
+        else:
             logger.warning(f"Cannot execute command: Unknown session type '{session_type}' for session {session_id}")
             message = f"Cannot execute command: Unknown session type '{session_type}'."
 
@@ -1393,7 +1415,7 @@ async def send_session_command(
              return {"status": "error", "message": f"Session {session_id} is not valid."}
         logger.error(f"MsfRpcError interacting with session {session_id}: {e}")
         return {"status": "error", "message": f"Error interacting with session {session_id}: {e}"}
-    except KeyError: # May occur if session disappears between list and access
+    except KeyError:
         logger.error(f"Session {session_id} likely disappeared (KeyError).")
         return {"status": "error", "message": f"Session {session_id} not found or disappeared."}
     except Exception as e:
