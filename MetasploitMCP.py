@@ -1017,6 +1017,12 @@ async def run_exploit(
     """
     logger.info(f"Request to run exploit '{module_name}'. Job: {run_as_job}, Check: {check_vulnerability}, Payload: {payload_name}")
 
+    # Parse main options gracefully (dict, "k=v,k=v" string, or None)
+    try:
+        options = _parse_options_gracefully(options)
+    except ValueError as _e:
+        return {"status": "error", "message": f"Invalid options format: {_e}", "module": module_name}
+
     # Parse payload options gracefully
     try:
         parsed_payload_options = _parse_options_gracefully(payload_options)
@@ -1101,7 +1107,11 @@ async def run_post_module(
         Dictionary with execution results or error details.
     """
     logger.info(f"Request to run post module {module_name} on session {session_id}. Job: {run_as_job}")
-    module_options = options or {}
+    try:
+        options = _parse_options_gracefully(options)
+    except ValueError as _e:
+        return {"status": "error", "message": f"Invalid options format: {_e}", "module": module_name}
+    module_options = dict(options)
     module_options['SESSION'] = session_id # Ensure SESSION is always set
 
     # Add basic session validation before running
@@ -1155,7 +1165,11 @@ async def run_auxiliary_module(
         Dictionary with execution results or error details.
     """
     logger.info(f"Request to run auxiliary module {module_name}. Job: {run_as_job}, Check: {check_target}")
-    module_options = options or {}
+    try:
+        options = _parse_options_gracefully(options)
+    except ValueError as _e:
+        return {"status": "error", "message": f"Invalid options format: {_e}", "module": module_name}
+    module_options = dict(options)
 
     if check_target:
         logger.info(f"Performing check first for auxiliary module {module_name}...")
